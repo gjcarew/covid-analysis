@@ -1,0 +1,213 @@
+---
+title: "DATAAVS 220 Final"
+author: "Gavin Carew"
+date: "11/12/2020"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Objective
+
+The objective of this memo is to use publicly available data to predict the number of Covid-19 an area will be experiencing in two weeks. 
+
+```{r libraries, include= FALSE}
+library(tidyverse)
+library(readxl)
+library(httr)
+library(zoo)
+library(caret)
+library(rpart)
+library(rpart.plot)
+set.seed(1234)
+
+```
+## About the data
+
+The bulk of the data is from the New York Times Covid-19 data which is free to use for non-commercial purposes. Two datasets were used from the New York Times; one that includes the number of Covid-19 cases and deaths by county and one that includes a survey of mask use by county. Other data comes from US government agencies for county population and area data. 
+```{r get public data,include=FALSE}
+# Public data url's
+mask_url <- "https://raw.githubusercontent.com/nytimes/covid-19-data/master/mask-use/mask-use-by-county.csv"
+cases_url <- "https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties.csv"
+county_pop_url <- "https://www2.census.gov/programs-surveys/popest/datasets/2010-2019/counties/totals/co-est2019-alldata.csv"
+county_area_url <- "https://www.epa.gov/sites/production/files/2016-04/ozone-county-population.xlsx"
+
+# Read into R
+masks <- read_csv(url(mask_url))
+cases <- read_csv(url(cases_url))
+county_pop <- read_csv(url(county_pop_url))
+
+httr::GET(county_area_url, write_disk(tf <- tempfile(fileext = ".xlsx")))
+county_area <- read_excel(tf, 1L)
+
+```
+The population and area data come from 2019 estimates. The mask data was from a survey conducted in early July by the New York Times. The use of masks in a particular area is not necessarily static, but it's the most comprehensive data available. The data on Covid-19 cases and deaths over time should be fairly accurate, more info on the methodology can be found here: https://github.com/nytimes/covid-19-data
+```{r merge data, include = FALSE}
+# Add FIPS codes to population and area data, select only relevant data
+county_area <- county_area %>% unite("fips", c("STATE FIPS", "COUNTY FIPS"), sep = "") %>% 
+  select(fips, `LAND AREA (Sqare Miles)`)
+
+county_pop <- county_pop %>% unite("fips", c("STATE", "COUNTY"), sep = "") %>% 
+  select(fips, POPESTIMATE2019)
+
+
+# Merge area, population, and masks dataframes with cases dataframe
+cases <- merge(x = cases, y = county_area, by = "fips", all.x = TRUE)
+cases <- merge(x = cases, y = county_pop, by = "fips", all.x = TRUE)
+cases <- merge(x = cases, y = masks, by.x = "fips", by.y = "COUNTYFP", all.x = TRUE)
+```
+
+In addition to the data already included, new features were added to make the data more useful for analysis. A summary of the new features is included below.
+
+population_density: County population divided by county area, in people per square mile.
+mask_compliance: A collapsed numerical approximation of mask use from 0 (never wear a mask around others) to 1 (always wear a mask around others).
+new_cases: New cases added since the previous day for a given county.
+new_deaths: New deaths added since the previous day for a given county.
+roll_avg_new_cases: The left-aligned, 7-day rolling average of new cases for a given county. Useful for smoothing out the new cases data.
+roll_avg_new_deaths: The left-aligned, 7-day rolling average of new deaths for a given county.
+future_cases: The number of cases that will occur 14 days from the given date.
+future_deaths: The number of deaths that will occur 14 days from the given date.
+
+Any NA cases were omitted. This means that data from the last 14 days will not be included as the future_cases feature will be NA. It also omits cases from non-states including the US Virgin Islands, Northern Mariana Islands, District of Columbia, and Puerto Rico. An example of one of the new features is plotted below.
+
+```{r feature engineering, echo=FALSE, message= FALSE}
+cases_df <- cases %>% 
+  # Add population density
+  mutate(population_density = as.numeric(POPESTIMATE2019 / `LAND AREA (Sqare Miles)`),
+         # Collapse mask compliance to a single column
+                          mask_compliance = (NEVER * 0) + (RARELY * .25) + (SOMETIMES * .5) + (FREQUENTLY * .75) + ALWAYS) %>% 
+  # select useful columns
+  select(fips, date, county, state, cases, deaths, population_density, mask_compliance) %>% 
+  # Add column for daily new cases and deaths
+  group_by(fips) %>%
+  arrange(date) %>%
+  mutate(new_cases = cases - lag(cases,1),
+         new_deaths = deaths - lag(deaths,1),
+         # Rolling average new cases and deaths
+         roll_avg_new_cases = rollmean(new_cases, k = 7, align = c("left"), fill = NA),
+         roll_avg_new_deaths = rollmean(new_deaths, k = 7, align = c("left"), fill = NA),
+         # Cases and deaths two weeks from now (prediction)
+         future_cases = lead(cases, 14),
+         future_deaths = lead(deaths, 14)) %>% 
+  # Drop NA's (will omit early and late data, but make for a more complete dataset)
+  drop_na() %>% 
+  # Omit non-states
+  filter(!(state %in% c("Virgin Islands", "Northern Mariana Islands", "District of Columbia", "Puerto Rico")))
+
+
+# Plot new cases and rolling average new deaths to ensure the new features are working
+
+cases_df %>% filter(state == "Washington") %>% 
+  ggplot(aes(x = date, color = county)) +
+  geom_smooth(aes(y = roll_avg_new_cases), se = F)+
+  labs(title = "7-day rolling average of new Covid-19 cases", 
+       subtitle = "Washington State, by county",
+       x = "Date",
+       y = "Rolling average")+
+  theme_test()
+
+#summary(cases_df)
+
+
+
+
+```
+
+## Methods
+
+The first model tested was a linear model of future cases against the other features except future_deaths, in an attempt to prevent data leakage. There was concern about the potential for data leakage with future cases as the dependent variable. The current cases data is technically the same as the future cases data, just offset by two weeks. As a result, overfitting is a risk with the linear model.
+
+The second model used was decision tree using the ANOVA method for regression. The decision tree is useful for determining the most important features and looking for non-linear relationships. 
+
+## Results
+
+The linear model performed extremely well, with an adjusted R-squared of over .99 and a RMSE of about 287. The coefficients seem to make sense. The RMSE of the test data was similar to that of the training data, indicating the model is not overfit.
+
+The most important feature by far based on the t-statistic is the current number of cases, which makes sense. The number of cases two weeks from now will be, at minimum, the current number of cases.The rolling average new cases was the second most important variable, everything else was of little importance. 
+
+```{r linear models, echo=FALSE, message = FALSE}
+in_train = createDataPartition(y = cases_df$cases,
+p = 0.8, list = FALSE)
+
+cases_df_train = cases_df[in_train, ]
+cases_df_test = cases_df[-in_train, ]
+
+# Full linear model
+
+full_model = train(future_cases ~ cases + deaths + population_density + mask_compliance + new_cases + new_deaths + roll_avg_new_cases + roll_avg_new_deaths , data = cases_df_train,
+method = "lm", na.action = na.pass)
+
+summary(full_model)
+full_model
+
+full_model_pred = predict(full_model, newdata = cases_df_test)
+
+print("Results of predicting on the test data:")
+postResample(pred = full_model_pred, obs = cases_df_test$future_cases)
+
+cases_df_test$predicted = full_model_pred
+
+plot(varImp(full_model))
+
+cases_df_test %>% ggplot(aes(x = future_cases, y = predicted))+
+  geom_point() +
+  theme_test() +
+  geom_abline(slope = 1, intercept = 0, color = "red", size = 1, alpha = 0.5) +
+  labs(title = "Future cases vs. predicted future cases", subtitle = "Red line indicates perfect prediction")
+
+
+
+
+```
+
+The decision tree model supports these results. The only feature used in the decision tree was the number of cases. The RMSE was much higher for the decision tree than for the linear model, so the linear model is the better performer.
+
+```{r decision tree, echo = FALSE}
+# Select relevant features, split in to train-test sets
+# Note: this was done separately so each model chunk can be run independently
+tree_data <- cases_df %>% select(-future_deaths, -county, -state, -date, -fips)
+
+in_tree_train = createDataPartition(y = tree_data$future_cases,
+p = 0.8, list = FALSE)
+tree_train = tree_data[in_tree_train, ]
+tree_test = tree_data[-in_tree_train, ]
+
+tree_m1 <- rpart(
+    formula = future_cases ~ .,
+    data    = tree_train,
+    method  = "anova")
+
+rpart.plot(tree_m1)
+
+pred <- predict(tree_m1, tree_test)
+cat("Decision tree RMSE: ", RMSE(pred, tree_test$future_cases))
+
+
+```
+## Conclusion
+
+The number of cases, both in the US and in individual counties, has largely increased at a linear rate. This is visible in the plot below, where the number of cases for each county in Washington State is plotted over time. 
+
+```{r, echo = FALSE, message= FALSE}
+cases_df %>% filter(state == "Washington") %>% 
+  ggplot(aes(x = date, color = county)) +
+  geom_smooth(aes(y = cases), se = F)+
+  labs(title = "Covid-19 cases", 
+       subtitle = "Washington State, by county",
+       x = "Date",
+       y = "Number of cases")+
+  theme_test()
+```
+
+Even in counties like Yakima that experienced massive new case growth and subsequent shrinkage in the number of new cases, the curve could be fairly well-approximated with a linear model. 
+
+The model created here might be more useful in certain contexts than in others. A result within 287 cases is less likely to inform policy and decision making in a small county (where the error as a percentage of total cases is higher) than in a larger county. 
+
+Further analysis could look at the number of new cases, which is less likely to be a direct linear relationship to the current number of cases, or at the number of deaths which has varied as treatment options have improved.
+
+
