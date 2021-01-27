@@ -1,5 +1,5 @@
 ---
-title: "DATAAVS 220 Final"
+title: "Covid data for ML"
 author: "Gavin Carew"
 date: "11/12/2020"
 output:
